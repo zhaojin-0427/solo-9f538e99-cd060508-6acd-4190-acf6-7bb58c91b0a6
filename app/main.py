@@ -13,9 +13,11 @@ from . import service
 from .database import init_db
 from .models import (
     AssemblyOut,
+    FeedPageOut,
     FragmentIn,
     FragmentOut,
     PublicationOut,
+    SubscriptionOut,
 )
 
 
@@ -27,10 +29,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Seismic Waveform Assembly API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Ingest out-of-order waveform fragments, assemble them into whole "
-        "UTC-minute records and publish immutable minutes for phase pickers."
+        "UTC-minute records and publish immutable minutes for phase pickers. "
+        "Subscriptions expose a per-station paged feed that replays the "
+        "current publications as a fixed start point, then follows minute "
+        "withdrawals and re-publications over an append-only change log."
     ),
     lifespan=lifespan,
 )
@@ -107,3 +112,55 @@ def get_publication(pub_id: int) -> JSONResponse | dict[str, Any]:
     if result is None:
         return JSONResponse(status_code=404, content={"detail": "publication not found"})
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Single-station data feed
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/subscriptions",
+    response_model=SubscriptionOut,
+    status_code=201,
+    summary="Create a single-station feed subscription",
+)
+def create_subscription(
+    station: str = Query(
+        min_length=1, description="Station whose minute waveform feed is wanted"
+    ),
+) -> dict[str, Any]:
+    """Freeze the station's currently valid publications as the start point.
+
+    The starting point never changes afterwards: paging it always returns the
+    same publication ids and frozen waveforms.  Corrections that arrive later
+    are delivered on the live tail as withdraw followed by upsert events.
+    """
+    return service.create_subscription(station)
+
+
+@app.get(
+    "/subscriptions/{subscription_id}/feed",
+    response_model=FeedPageOut,
+    summary="Read one page of a subscription feed",
+)
+def get_feed(
+    subscription_id: int,
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque cursor from the previous page; omit for the first page",
+    ),
+    page_size: int = Query(
+        default=service.DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=service.MAX_PAGE_SIZE,
+        description="Maximum events on this page",
+    ),
+) -> dict[str, Any]:
+    """Return one deterministic page.
+
+    Retrying the same cursor (also after a restart) returns the same page.
+    Snapshot pages (``phase="snapshot"``) deliver the frozen starting point;
+    once exhausted, pages switch to ``phase="live"`` and follow the append-only
+    change log.  On the live tail, polling the returned cursor when
+    ``has_more=false`` simply returns an empty event list with the same cursor.
+    """
+    return service.get_feed_page(subscription_id, cursor, page_size)

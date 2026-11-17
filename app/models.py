@@ -73,3 +73,42 @@ class PublicationOut(BaseModel):
     fragment_set_hash: str
     created_at: str
     items: list[PublicationItemOut]
+
+
+# --------------------------------------------------------------------------- #
+# Single-station data feed
+# --------------------------------------------------------------------------- #
+class SubscriptionOut(BaseModel):
+    subscription_id: int
+    station: str
+    # Size of the immutable starting point (number of pages worth of minutes
+    # is governed by the page size used when reading the feed).
+    snapshot_size: int
+    created_at: str
+    # Cursor to read the first page of the frozen starting point.
+    next_cursor: str
+
+
+class FeedEventOut(BaseModel):
+    # Log offset; unique inside one subscription and monotonically increasing.
+    seq: int
+    station: str
+    minute_utc: datetime
+    # "upsert" delivers (or replaces) a minute's waveform; "withdraw" recalls
+    # a previously delivered publication id.
+    event_type: str
+    publication_id: int | None = None
+    # Populated for upsert events; absent on withdraw.
+    publication: PublicationOut | None = None
+
+
+class FeedPageOut(BaseModel):
+    subscription_id: int
+    station: str
+    # "snapshot" pages deliver the frozen starting point; "live" pages
+    # deliver withdraw/re-publish changes that happened afterwards.
+    phase: str
+    events: list[FeedEventOut]
+    next_cursor: str | None = None
+    # True while the starting point is still being paged through.
+    has_more: bool

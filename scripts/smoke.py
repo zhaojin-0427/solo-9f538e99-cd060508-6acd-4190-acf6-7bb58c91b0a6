@@ -129,6 +129,73 @@ def main() -> int:
                  params={"station": "NOPE", "minute_utc": MIN})
     check("unknown publication 404", r.status_code == 404)
 
+    # 13. Single-station data feed.
+    # 13a. A subscription freezes the station's current fresh publications.
+    r = http.post("/subscriptions", params={"station": ST})
+    check("subscription created", r.status_code == 201)
+    sub = r.json()
+    check("snapshot holds the current publication only",
+          sub["snapshot_size"] == 1)
+    sid = sub["subscription_id"]
+
+    def read_feed(cursor, page_size=1):
+        params = {"page_size": page_size}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return http.get(f"/subscriptions/{sid}/feed", params=params).json()
+
+    # 13b. Page the immutable starting point; retrying a cursor is identical.
+    first = read_feed(sub["next_cursor"])
+    check("first page is a snapshot upsert",
+          first["phase"] == "snapshot"
+          and first["events"][0]["event_type"] == "upsert"
+          and first["events"][0]["publication_id"] == pub2["id"])
+    check("snapshot wave frozen at subscription time",
+          first["events"][0]["publication"]["wave"][0] == 42)
+    retry = read_feed(sub["next_cursor"])
+    check("same cursor returns the same page", retry == first)
+
+    # Advance to the live tail.
+    cursor = first["next_cursor"]
+    tail = read_feed(cursor)
+    check("second page switches to live phase", tail["phase"] == "live")
+    check("live tail starts empty", tail["events"] == []
+          and tail["has_more"] is False)
+    tail_cursor = tail["next_cursor"]
+
+    # 13c. A correction must deliver withdraw before the replacement upsert.
+    corrected = [77] + list(range(1, 60))
+    http.post("/fragments", json=frag(1, 3, 0, corrected[:30]))
+    page = read_feed(tail_cursor)
+    check("correction emits withdraw first",
+          [e["event_type"] for e in page["events"]] == ["withdraw"]
+          and page["events"][0]["publication_id"] == pub2["id"]
+          and page["events"][0]["publication"] is None)
+    repub = http.post("/publications",
+                      params={"station": ST, "minute_utc": MIN}).json()
+    page2 = read_feed(page["next_cursor"])
+    check("re-publish emits replacement upsert",
+          [e["event_type"] for e in page2["events"]] == ["upsert"]
+          and page2["events"][0]["publication_id"] == repub["id"]
+          and page2["events"][0]["publication"]["wave"] == corrected)
+    check("withdraw precedes replacement in the log",
+          page["events"][0]["seq"] < page2["events"][0]["seq"])
+
+    # 13d. Polling the caught-up tail cursor is a stable, empty page.
+    idle = read_feed(page2["next_cursor"])
+    check("idle tail poll is empty and stable",
+          idle["events"] == [] and idle["has_more"] is False
+          and idle["next_cursor"] == page2["next_cursor"])
+
+    # 13e. Feed is scoped to its station and cursors are validated.
+    http.post("/fragments", json=frag(1, 1, 0, [1], station="OTHER"))
+    other = read_feed(idle["next_cursor"])
+    check("other stations never appear on this feed", other["events"] == [])
+    r = http.get(f"/subscriptions/{sid}/feed", params={"cursor": "garbage"})
+    check("malformed cursor rejected", r.status_code == 400)
+    r = http.get("/subscriptions/999999/feed")
+    check("unknown subscription 404", r.status_code == 404)
+
     print()
     if failures:
         print(f"{len(failures)} FAILURE(S): {failures}")

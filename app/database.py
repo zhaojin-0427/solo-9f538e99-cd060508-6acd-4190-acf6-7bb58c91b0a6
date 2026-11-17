@@ -52,6 +52,56 @@ CREATE TABLE IF NOT EXISTS publication_items (
 
 CREATE INDEX IF NOT EXISTS idx_pub_items_pub
     ON publication_items (publication_id);
+
+-- ----------------------------------------------------------------------- --
+-- Single-station data feed (CDC over publications)
+--
+-- ``feed_events`` is the append-only change log.  Every business transition
+-- that matters to a subscriber is committed here *inside the same
+-- transaction* as the fragment/publication change that caused it:
+--   * upsert  - a publication becomes the current value of a station-minute
+--               (initial publish or replacement after a correction)
+--   * withdraw - a previously current publication is no longer current
+--                (the fragment set changed and the record went stale)
+-- ``seq`` is a global monotonic log offset, so per-station ordering follows
+-- the global commit order.  Rows are never updated or deleted.
+-- ----------------------------------------------------------------------- --
+CREATE TABLE IF NOT EXISTS feed_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    station    TEXT    NOT NULL,
+    minute_utc TEXT    NOT NULL,
+    event_type TEXT    NOT NULL CHECK (event_type IN ('upsert', 'withdraw')),
+    pub_id     INTEGER REFERENCES publications(id),
+    created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_feed_station_seq
+    ON feed_events (station, id);
+
+-- A subscription freezes one station's set of non-stale publications at
+-- creation time.  ``max_event_id`` marks the high-water mark of the change
+-- log at that instant; everything with seq <= max_event_id is represented
+-- in the snapshot, everything after it arrives as live events.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    station      TEXT    NOT NULL,
+    max_event_id INTEGER NOT NULL,
+    created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Immutable starting point of a subscription: one row per fresh publication
+-- at the moment the subscription was created.
+CREATE TABLE IF NOT EXISTS subscription_snapshot (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    station         TEXT    NOT NULL,
+    minute_utc      TEXT    NOT NULL,
+    pub_id          INTEGER NOT NULL REFERENCES publications(id),
+    UNIQUE (subscription_id, pub_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_sub
+    ON subscription_snapshot (subscription_id, id);
 """
 
 
